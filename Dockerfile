@@ -1,6 +1,31 @@
-FROM php:8.2-apache-bookworm
+# syntax=docker/dockerfile:1
+# =============================================================================
+# Orion Clinic — Dockerfile multi-stage (dioptimasi)
+# Cara pakai:
+#   1. Backup Dockerfile lama, lalu ganti dengan file ini (nama tetap Dockerfile).
+#   2. Di compose.yaml (dev) tambahkan `target: dev` di bawah `build:`
+#      (kalau tidak, build default menghasilkan target runtime dan mekanisme
+#      sinkronisasi vendor untuk bind mount tidak jalan).
+#   3. Build & ukur:
+#        docker build -t orionclinic-app:runtime .
+#        docker build -t orionclinic-app:dev --target dev .
+#        docker images | grep orionclinic
+#   4. Untuk distribusi (image sudah jadi, tanpa bind mount) pakai
+#      compose.orion-prod.yaml.
+#
+# Target default (tahap terakhir) = runtime: image distribusi, tanpa dev deps,
+# tanpa duplikasi vendor, tanpa compiler/paket -dev.
+# Target dev: untuk jalan lokal dengan bind mount, perilaku sama seperti
+# Dockerfile lama (dev deps + sinkronisasi vendor via /opt/vendor-dist).
+# =============================================================================
 
-# Install system dependencies & required PHP extensions for CodeIgniter 4
+# ---------------------------------------------------------------------------
+# Tahap 1 — builder: compile ekstensi PHP + install dependensi Composer.
+# Semua yang ada di sini (compiler, paket -dev, git, unzip, composer)
+# TIDAK ikut ke image akhir.
+# ---------------------------------------------------------------------------
+FROM php:8.2-apache-bookworm AS builder
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         git \
@@ -22,10 +47,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         opcache \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy Composer binary from official pinned image
 COPY --from=composer:2.8 /usr/bin/composer /usr/bin/composer
 
-# Configure Apache DocumentRoot to /var/www/html/public and enable URL rewriting
+WORKDIR /var/www/html
+
+# Hanya dependensi produksi (tanpa phpunit/faker/vfsstream)
+COPY composer.json composer.lock ./
+RUN composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader --no-scripts
+
+# ---------------------------------------------------------------------------
+# Tahap 2 — dev: untuk jalan lokal dengan bind mount (perilaku lama).
+# Termasuk dev deps + mekanisme sinkronisasi vendor via /opt/vendor-dist.
+# Dipakai dengan: docker build --target dev .
+# ---------------------------------------------------------------------------
+FROM builder AS dev
+
+RUN composer install --no-interaction --prefer-dist --optimize-autoloader \
+    && cp -a /var/www/html/vendor /opt/vendor-dist \
+    && sha256sum composer.lock > /opt/vendor-dist/.lock-hash \
+    && cp /opt/vendor-dist/.lock-hash /var/www/html/vendor/.lock-hash
+
 ENV APACHE_DOCUMENT_ROOT=/var/www/html/public
 RUN a2enmod rewrite headers \
     && sed -ri -e "s!/var/www/html!${APACHE_DOCUMENT_ROOT}!g" /etc/apache2/sites-available/*.conf \
@@ -33,7 +74,6 @@ RUN a2enmod rewrite headers \
     && sed -ri -e "s!AllowOverride None!AllowOverride All!g" /etc/apache2/apache2.conf \
     && echo "ServerName localhost" >> /etc/apache2/apache2.conf
 
-# Configure PHP runtime settings for CodeIgniter 4
 RUN { \
         echo "variables_order = EGPCS"; \
         echo "upload_max_filesize = 10M"; \
@@ -44,17 +84,10 @@ RUN { \
 
 WORKDIR /var/www/html
 
-# Install Composer dependencies reproducibly from composer.lock (including dev deps for testing)
-COPY composer.json composer.lock ./
-RUN composer install --no-interaction --prefer-dist --optimize-autoloader \
-    && cp -a /var/www/html/vendor /opt/vendor-dist \
-    && sha256sum composer.lock > /opt/vendor-dist/.lock-hash \
-    && cp /opt/vendor-dist/.lock-hash /var/www/html/vendor/.lock-hash
-
-# Copy application source code
 COPY . .
 
-# Create idempotent entrypoint script to keep vendor/ and writable/ healthy with bind mounts
+# Entrypoint lama (tidak diubah): sinkronkan vendor/ bila bind mount
+# menutupinya, siapkan writable/ + public/uploads/, lalu jalankan Apache.
 RUN cat <<'EOF' > /usr/local/bin/orion-entrypoint.sh
 #!/bin/sh
 set -e
@@ -89,4 +122,61 @@ RUN chmod +x /usr/local/bin/orion-entrypoint.sh \
 EXPOSE 80
 
 ENTRYPOINT ["/usr/local/bin/orion-entrypoint.sh"]
+CMD ["apache2-foreground"]
+
+# ---------------------------------------------------------------------------
+# Tahap 3 — runtime: image distribusi (target default, tahap terakhir).
+# Hanya berisi: base Apache + runtime libs + ekstensi hasil compile + vendor
+# produksi + kode aplikasi. Tanpa compiler, tanpa paket -dev, tanpa git/unzip,
+# tanpa composer, tanpa duplikasi vendor, tanpa dev deps.
+# Tidak butuh bind mount: kode aplikasi sudah ada di dalam image.
+# ---------------------------------------------------------------------------
+FROM php:8.2-apache-bookworm AS runtime
+
+# Runtime libs yang dibutuhkan ekstensi hasil compile (bukan paket -dev).
+# Nama paket ini sudah diverifikasi ada di Debian Bookworm.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        libicu72 \
+        libzip4 \
+        libpng16-16 \
+        libjpeg62-turbo \
+        libfreetype6 \
+        libonig5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Salin ekstensi PHP hasil compile + konfigurasinya dari builder
+COPY --from=builder /usr/local/lib/php/extensions/ /usr/local/lib/php/extensions/
+COPY --from=builder /usr/local/etc/php/conf.d/ /usr/local/etc/php/conf.d/
+
+# Salin vendor produksi dari builder (satu-satunya salinan vendor di image ini)
+COPY --from=builder /var/www/html/vendor /var/www/html/vendor
+
+# Konfigurasi Apache: DocumentRoot ke public + rewrite (sama seperti sebelumnya)
+ENV APACHE_DOCUMENT_ROOT=/var/www/html/public
+RUN a2enmod rewrite headers \
+    && sed -ri -e "s!/var/www/html!${APACHE_DOCUMENT_ROOT}!g" /etc/apache2/sites-available/*.conf \
+    && sed -ri -e "s!/var/www/!${APACHE_DOCUMENT_ROOT}/!g" /etc/apache2/apache2.conf /etc/apache2/conf-available/*.conf \
+    && sed -ri -e "s!AllowOverride None!AllowOverride All!g" /etc/apache2/apache2.conf \
+    && echo "ServerName localhost" >> /etc/apache2/apache2.conf
+
+# Konfigurasi PHP runtime (sama seperti sebelumnya)
+RUN { \
+        echo "variables_order = EGPCS"; \
+        echo "upload_max_filesize = 10M"; \
+        echo "post_max_size = 12M"; \
+        echo "memory_limit = 256M"; \
+        echo "date.timezone = Asia/Jakarta"; \
+    } > /usr/local/etc/php/conf.d/orionclinic.ini
+
+WORKDIR /var/www/html
+
+# Kode aplikasi (vendor/.git/.env sudah dikecualikan .dockerignore)
+COPY . .
+
+RUN mkdir -p writable/cache writable/logs writable/session writable/uploads writable/debugbar public/uploads \
+    && chown -R www-data:www-data writable public/uploads
+
+EXPOSE 80
+
 CMD ["apache2-foreground"]
